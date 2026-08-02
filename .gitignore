@@ -1,0 +1,4 @@
+﻿__pycache__/
+*.pyc
+keeper.log
+battery.txt
