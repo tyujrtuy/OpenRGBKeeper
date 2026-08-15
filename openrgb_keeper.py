@@ -1,17 +1,18 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 OpenRGB Keeper (persistent lighting + battery management + device replug recovery)
 
-  1. Start OpenRGB if needed
+  1. Start OpenRGB if needed (--startminimized --profile 123 --server)
   2. Capture profile state (mode + colors)
-  3. Simple main loop (every 5s):
-     - Poll Candy device presence (every 3s in daemon thread)
+  3. Simple main loop (every ~5s):
+     - Watch device presence via WMI events (daemon thread)
      - On physical removal: wait for return, fast-restart OpenRGB
-     - On non-physical event: re-apply state via SDK directly
-     - Periodic state push (every 10s)
-     - Battery check (every 300s): below 50% off, above 65% on
+     - On device event: re-apply state via SDK directly
+     - Periodic state push (every 30s)
+     - Battery check (every 300s): below 35% off, above 50% on (hysteresis)
+     - Charging status fast refresh (every 5s) for tray red dot
      - SDK heartbeat (every 120s)
-  4. Battery info written to battery.txt for OpenRGB tray icon
+  4. Battery info written to battery.txt for OpenRGB tray icon / status bar
 """
 
 import os
@@ -28,6 +29,7 @@ import configparser
 from pathlib import Path
 
 from openrgb import OpenRGBClient
+from openrgb.utils import RGBColor
 
 import libusb_package
 import usb.core
@@ -43,8 +45,8 @@ OPENRGB_PORT = 6742
 OPENRGB_EXE = r"C:\Program Files\OpenRGB\OpenRGB.exe"
 OPENRGB_ARGS = "--startminimized --profile 123 --server"
 
-HIGH_FREQ_INTERVAL = 10          # push every 10s (shorter = less red flash on wake)
-LOW_FREQ_INTERVAL = 120       # fallback push / SDK heartbeat every 2 minutes
+HIGH_FREQ_INTERVAL = 30
+LOW_FREQ_INTERVAL = 120       # fallback push every 2 minutes
 RECONNECT_DELAY = 10
 STATE_CAPTURE_DELAY = 20
 STABILITY_CHECK_INTERVAL = 10
@@ -53,7 +55,10 @@ OPENRGB_START_DELAY = 30
 MAX_START_RETRIES = 6
 
 RAZER_VID = 0x1532
+# Known Razer Naga Pro PIDs (receiver enumerates as different PIDs)
+RAZER_PIDS = (0x0090, 0x008F, 0x008E, 0x0091)
 BATTERY_CHECK_INTERVAL = 300
+CHARGE_CHECK_INTERVAL = 5
 BATTERY_LOW_THRESHOLD = 35
 BATTERY_HIGH_THRESHOLD = 50
 
@@ -71,6 +76,8 @@ def write_battery_file(pct, charging):
     except Exception:
         pass
 
+
+
 # Devices known to NOT support DeviceSaveMode() (OpenRGB base class is a no-op)
 # PowerPlay/Candy: RGBController_LogitechGPowerPlay does not override DeviceSaveMode(), @save :x:
 # Razer Naga Pro: RazerController does not implement DeviceSaveMode()
@@ -78,24 +85,31 @@ UNSUPPORTED_SAVE_KEYWORDS = ["candy", "powerplay", "razer naga pro"]
 
 KILL_RETRY_MAX = 5
 KILL_VERIFY_INTERVAL = 2
+KILL_COOLDOWN = 60  # seconds between force-kills (WinRing0 protection)
+last_force_kill_ts = 0.0
 
 # ── Logging ──────────────────────────────────────────
 LOG_DIR  = Path(os.environ.get("APPDATA", ".")) / "OpenRGB" / "keeper"
 LOG_FILE = LOG_DIR / "keeper.log"
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
+        RotatingFileHandler(str(LOG_FILE), maxBytes=5*1024*1024, backupCount=3, encoding="utf-8"),
     ],
 )
+if sys.stdout is not None:
+    log_root = logging.getLogger()
+    log_root.addHandler(logging.StreamHandler(sys.stdout))
 log = logging.getLogger("OpenRGBKeeper")
 
-# Enable faulthandler to log segfaults / crashes to the log file
-_fault_log = open(str(LOG_FILE), "a", encoding="utf-8")
+# Enable faulthandler to log segfaults / crashes to a separate file.
+# NOTE: opening the main keeper.log here would hold a handle that blocks
+# RotatingFileHandler rollover (os.rename fails on Windows).
+_fault_log = open(str(LOG_FILE.with_name("keeper_fault.log")), "a", encoding="utf-8")
 faulthandler.enable(file=_fault_log)
 
 
@@ -118,7 +132,6 @@ saw_device_removal = False
 MONITORED_DEVICES = [
     "VID_046D&PID_C53A",  # Candy mousepad only
 ]
-DEVICE_POLL_INTERVAL = 3  # seconds between device presence checks
 
 
 def check_device_present(vid_pid):
@@ -139,13 +152,23 @@ def check_device_present(vid_pid):
         return True  # Assume present to avoid false restarts
 
 
+# Persistent PowerShell process that subscribes to WMI device-change events.
+# Replaces the old every-3s PowerShell polling (one process, idle until an event).
+_WMI_WATCHER_PS = (
+    "$watcher = New-Object System.Management.ManagementEventWatcher; "
+    "$watcher.Query = New-Object System.Management.WqlEventQuery('SELECT * FROM Win32_DeviceChangeEvent'); "
+    "$watcher.Start(); "
+    "while ($true) { $null = $watcher.WaitForNextEvent(); "
+    "[Console]::WriteLine('change'); [Console]::Out.Flush() }"
+)
+
+
 def start_device_listener():
-    """Start a daemon thread that polls for USB device presence changes."""
+    """Start a daemon thread that watches USB device presence via WMI events."""
 
     def listener_thread():
         global need_openrgb_restart, saw_device_removal
-        log.info("Device presence poller started (checking every %ds for %d devices)" %
-                 (DEVICE_POLL_INTERVAL, len(MONITORED_DEVICES)))
+        log.info("Device presence poller started (WMI event subscription)")
 
         # Track presence state for each device
         presence = {}
@@ -153,10 +176,24 @@ def start_device_listener():
             presence[vid_pid] = check_device_present(vid_pid)
             log.info("  %s: %s" % (vid_pid, "present" if presence[vid_pid] else "absent"))
 
+        proc = None
         heartbeat_counter = 0
         while True:
-            time.sleep(DEVICE_POLL_INTERVAL)
             try:
+                if proc is None or proc.poll() is not None:
+                    log.info("Starting WMI device watcher...")
+                    proc = subprocess.Popen(
+                        ["powershell", "-NoProfile", "-NonInteractive", "-Command", _WMI_WATCHER_PS],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        creationflags=0x08000000  # CREATE_NO_WINDOW
+                    )
+                line = proc.stdout.readline()
+                if not line:
+                    # Watcher exited without output — wait and restart
+                    time.sleep(2)
+                    continue
+
+                # A device change event fired — re-check monitored devices
                 for vid_pid in MONITORED_DEVICES:
                     is_present = check_device_present(vid_pid)
                     was_present = presence[vid_pid]
@@ -187,6 +224,7 @@ def start_device_listener():
 
             except Exception as e:
                 log.warning("Device poll error: %s" % e)
+                time.sleep(1)
 
     t = threading.Thread(target=listener_thread, daemon=True)
     t.start()
@@ -208,8 +246,6 @@ def is_process_elevated():
 def supports_save_mode(dev_name):
     """Check if device is known to support DeviceSaveMode().
     Returns False for devices where OpenRGB's controller has an empty no-op implementation."""
-    if not dev_name:
-        return True  # Can't check, assume supported
     name_lower = dev_name.lower()
     for keyword in UNSUPPORTED_SAVE_KEYWORDS:
         if keyword in name_lower:
@@ -257,7 +293,25 @@ def is_sdk_responding():
 
 def kill_openrgb():
     """Kill all OpenRGB processes with verification loop.
+    Cooldown: skip repeated force-kills within KILL_COOLDOWN seconds to
+    protect the WinRing0 driver (force-kill can wedge it).
     Returns True if all processes are dead, False if kill failed."""
+    global last_force_kill_ts
+    if not is_openrgb_running():
+        return True
+    now = time.time()
+    if now - last_force_kill_ts < KILL_COOLDOWN:
+        log.warning("Force-kill cooldown active (%ds left); waiting for graceful exit..." %
+                    int(KILL_COOLDOWN - (now - last_force_kill_ts)))
+        for _ in range(int(KILL_COOLDOWN / 3)):
+            time.sleep(3)
+            if not is_openrgb_running():
+                log.info("OpenRGB exited during cooldown wait (no force-kill needed)")
+                return True
+        if not is_openrgb_running():
+            return True
+        log.warning("Cooldown wait expired, force-killing anyway")
+    last_force_kill_ts = time.time()
     log.info("Killing OpenRGB processes...")
 
     for attempt in range(KILL_RETRY_MAX):
@@ -269,12 +323,12 @@ def kill_openrgb():
         )
 
         if result.returncode == 0:
-            log.info("taskkill succeeded: %s" % (result.stdout or "").strip())
-        elif (result.stderr and ("not found" in result.stderr.lower() or "no tasks" in result.stderr.lower())):
+            log.info("taskkill succeeded: %s" % result.stdout.strip())
+        elif "not found" in result.stderr.lower() or "no tasks" in result.stderr.lower():
             log.info("No OpenRGB process found")
             return True
         else:
-            log.info("taskkill rc=%d: %s" % (result.returncode, (result.stderr or "").strip()))
+            log.info("taskkill rc=%d: %s" % (result.returncode, result.stderr.strip()))
 
         # Wait and verify
         time.sleep(KILL_VERIFY_INTERVAL)
@@ -461,14 +515,14 @@ def connect_fast():
 
 def restart_openrgb_fast(states_backup=None):
     """Kill and restart OpenRGB with optimized timing for physical replug recovery.
-    Returns (client, devs) or (None, None) on failure."""
+    Returns (client, devs, states) or (None, None, None) on failure."""
     log.info("=== FAST RESTART: killing OpenRGB for USB handle refresh ===")
     kill_openrgb()
 
     log.info("Starting OpenRGB (fast restart)...")
     if not start_openrgb():
         log.error("Failed to start OpenRGB during fast restart")
-        return None, None
+        return None, None, None
 
     # Wait for SDK to become available (shorter than normal)
     log.info("Waiting 15s for OpenRGB to start...")
@@ -480,11 +534,11 @@ def restart_openrgb_fast(states_backup=None):
         time.sleep(5)
     else:
         log.error("SDK not ready after fast restart")
-        return None, None
+        return None, None, None
 
     client, devs = connect_fast()
     if client is None:
-        return None, None
+        return None, None, None
 
     # Apply saved state immediately (no profile wait — we have the state in memory)
     if states_backup:
@@ -499,21 +553,128 @@ def restart_openrgb_fast(states_backup=None):
     return client, devs, states_backup
 
 
+def parse_orp_profile(profile_path):
+    """Parse an OpenRGB v4 profile (.orp) file.
+    Returns list of (name, active_mode, colors_uint32) in file order."""
+    import struct as _struct
+
+    def _u16(b, p): return _struct.unpack_from("<H", b, p)[0], p + 2
+    def _u32(b, p): return _struct.unpack_from("<I", b, p)[0], p + 4
+    def _i32(b, p): return _struct.unpack_from("<i", b, p)[0], p + 4
+    def _s(b, p):
+        n, p = _u16(b, p)
+        return b[p:p + n].rstrip(b"\0").decode("utf-8", "replace"), p + n
+
+    with open(profile_path, "rb") as f:
+        data = f.read()
+
+    if not data.startswith(b"OPENRGB_PROFILE"):
+        raise ValueError("Not an OpenRGB profile")
+
+    # Validate version (4 bytes after the 16-byte header)
+    if len(data) < 20:
+        raise ValueError("Profile too short")
+    version = _struct.unpack_from("<I", data, 16)[0]
+    if version != 4:
+        log.warning("Unexpected profile version %d (expected 4)" % version)
+
+    p = 16 + 4  # header + version
+    devices = []
+    while p < len(data):
+        if p + 4 > len(data):
+            log.warning("Truncated profile: no size field at %d" % p)
+            break
+        size, p = _u32(data, p)
+        if size < 4 or p + (size - 4) > len(data):
+            log.warning("Truncated profile: device block size %d invalid at %d" % (size, p))
+            break
+        end = p + size - 4
+        _dtype, p = _u32(data, p)
+        name, p = _s(data, p)
+        _vendor, p = _s(data, p)
+        _desc, p = _s(data, p)
+        _ver, p = _s(data, p)
+        _serial, p = _s(data, p)
+        _loc, p = _s(data, p)
+        _num_modes, p = _u16(data, p)
+        active_mode, p = _i32(data, p)
+        for _ in range(_num_modes):
+            _mname, p = _s(data, p)
+            for _ in range(12):
+                p += 4
+            _mc, p = _u16(data, p)
+            p += 4 * _mc
+        _num_zones, p = _u16(data, p)
+        for _ in range(_num_zones):
+            _zname, p = _s(data, p)
+            for _ in range(4):
+                p += 4
+            _mlen, p = _u16(data, p)
+            if _mlen > 0:
+                _h, p = _u32(data, p)
+                _w, p = _u32(data, p)
+                p += 4 * _h * _w
+            _nseg, p = _u16(data, p)
+            for _ in range(_nseg):
+                _segname, p = _s(data, p)
+                p += 12
+        _num_leds, p = _u16(data, p)
+        for _ in range(_num_leds):
+            _lname, p = _s(data, p)
+            p += 4
+        _num_colors, p = _u16(data, p)
+        colors = []
+        for _ in range(_num_colors):
+            c, p = _u32(data, p)
+            colors.append(c)
+        devices.append((name, active_mode, colors))
+        p = end
+    return devices
+
+
+def load_expected_dram_states():
+    """Load ENE DRAM expected states from profile 123.orp (by occurrence order).
+    Returns list of (mode_idx, [RGBColor]) for each ENE DRAM in the profile."""
+    profile_path = os.path.join(os.environ.get("APPDATA", ""), "OpenRGB", "123.orp")
+    try:
+        devices = parse_orp_profile(profile_path)
+        drams = []
+        for name, mode_idx, colors_u32 in devices:
+            if "ENE DRAM" in name:
+                colors = []
+                for c in colors_u32:
+                    r = (c >> 16) & 0xFF
+                    g = (c >> 8) & 0xFF
+                    b = c & 0xFF
+                    colors.append(RGBColor(r, g, b))
+                drams.append((mode_idx, colors))
+        if drams:
+            log.info("Profile expected states loaded: %d ENE DRAM device(s) from %s" % (len(drams), os.path.basename(profile_path)))
+        return drams
+    except Exception as e:
+        log.warning("Failed to parse profile for DRAM states: %s" % e)
+        return []
+
+
 def capture_state(devs):
     states = []
-    razer_idx = find_razer_index(devs)
+    dram_expected = load_expected_dram_states()
+    dram_idx = 0
     for i, dev in enumerate(devs):
         try:
             mode_idx = dev.active_mode
             colors = list(dev.colors)
-            # For Razer mouse, always save as Direct mode (0)
-            # because Static/Off modes don't work on Naga Pro
-            if i == razer_idx and mode_idx != 0:
-                log.info("  Device %d [%s]: mode=%d->0 (forced Direct), leds=%d, colors=%s" % (i, dev.name, dev.active_mode, len(colors), colors))
-                mode_idx = 0
-            else:
-                log.info("  Device %d [%s]: mode=%d, leds=%d, colors=%s" % (i, dev.name, mode_idx, len(colors), colors))
+            # ENE DRAM may report Off after boot even though the saved profile
+            # expects Direct+color. Use the profile expected state instead so
+            # the periodic push keeps the DRAM lighting on.
+            if "ENE DRAM" in dev.name and dram_idx < len(dram_expected):
+                exp_mode, exp_colors = dram_expected[dram_idx]
+                mode_idx = exp_mode
+                colors = list(exp_colors)
+                log.info("  Device %d [%s]: using profile expected state (mode=%d, leds=%d)" % (i, dev.name, mode_idx, len(colors)))
+                dram_idx += 1
             states.append({"mode": mode_idx, "colors": colors})
+            log.info("  Device %d [%s]: mode=%d, leds=%d" % (i, dev.name, mode_idx, len(colors)))
         except Exception as e:
             log.error("  Device %d [%s] state read failed: %s" % (i, dev.name, e))
             states.append(None)
@@ -523,7 +684,6 @@ def capture_state(devs):
 def apply_state(devs, states, skip_index=-1):
     success_count = 0
     fail_count = 0
-    razer_idx = find_razer_index(devs)
     for i, state in enumerate(states):
         if state is None or i >= len(devs) or i == skip_index:
             continue
@@ -531,8 +691,6 @@ def apply_state(devs, states, skip_index=-1):
             dev = devs[i]
             dev.set_mode(state["mode"])
             dev.set_colors(state["colors"])
-            if i == razer_idx:
-                log.info("  Pushed mouse: mode=%d, colors=%s" % (state["mode"], state["colors"]))
             success_count += 1
         except Exception as e:
             log.error("  Device %d [%s] state apply failed: %s" % (i, dev.name, e))
@@ -551,17 +709,26 @@ def get_transaction_id():
         os.path.join(os.environ.get("APPDATA", ""), "rebt", "rebt.ini"),
     ]:
         if os.path.exists(path):
-            config = configparser.ConfigParser()
-            config.read(path)
-            for section in config.sections():
-                if "tranid" in config[section]:
-                    val = config[section]["tranid"]
-                    tran_id = int(val, 16) if val.startswith("0x") else int(val)
-                    log.info("Transaction ID from rebt.ini: 0x%02X" % tran_id)
+            try:
+                config = configparser.ConfigParser()
+                config.read(path)
+                for section in config.sections():
+                    if "tranid" in config[section]:
+                        val = config[section]["tranid"]
+                        tran_id = int(val, 16) if val.startswith("0x") else int(val)
+                        if not (0 <= tran_id <= 0xFF):
+                            tran_id = 0x3F
+                        log.info("Transaction ID from rebt.ini: 0x%02X" % tran_id)
+            except (ValueError, configparser.Error) as e:
+                log.warning("Failed to parse rebt.ini (%s), using default tranid" % e)
+                tran_id = 0x3F
             break
     return tran_id
 
 TRANSACTION_ID = get_transaction_id()
+
+# Serialize USB access (read_battery_raw vs read_charging_only)
+_usb_lock = threading.Lock()
 
 
 def generate_msg(command_class, command_id, data_size=0x02):
@@ -578,11 +745,15 @@ def generate_msg(command_class, command_id, data_size=0x02):
 def read_battery_raw():
     """Read battery level and charging status. Returns (battery_pct, is_charging).
     Returns (-1, False) on failure. Retries on transient USB errors."""
+    with _usb_lock:
+        return _read_battery_raw_locked()
+
+def _read_battery_raw_locked():
     for attempt in range(3):
         try:
-            dev = usb.core.find(idVendor=RAZER_VID, backend=_USB_BACKEND)
+            dev = usb.core.find(idVendor=RAZER_VID, custom_match=lambda d: d.idProduct in RAZER_PIDS, backend=_USB_BACKEND)
             if dev is None:
-                devs = list(usb.core.find(find_all=True, idVendor=RAZER_VID, backend=_USB_BACKEND))
+                devs = list(usb.core.find(find_all=True, idVendor=RAZER_VID, custom_match=lambda d: d.idProduct in RAZER_PIDS, backend=_USB_BACKEND))
                 if not devs:
                     return -1, False
                 dev = devs[0]
@@ -607,15 +778,26 @@ def read_battery_raw():
             usb.util.release_interface(dev, 0)
             usb.util.dispose_resources(dev)
 
-            if raw_battery == 0:
-                # Device might be sleeping or USB busy (Rebt conflict), retry
+            if charging == 0xFF:
+                log.warning("Charging byte returned 0xFF (sentinel/unknown), retrying... (attempt %d)" % (attempt + 1))
                 if attempt < 2:
                     time.sleep(1)
                     continue
+                log.error("Charging status consistently 0xFF - mouse firmware may need a power cycle")
                 return -1, False
 
-            battery_pct = int(raw_battery / 255 * 100)
-            is_charging = (charging == 1)
+            # 0xFF (255) is a sentinel value meaning the mouse firmware
+            # failed to return a valid battery reading. This is a known
+            # issue with Razer wireless mice (OpenRazer issue #2109, #2122).
+            # Treating it as 100% would incorrectly keep lighting on when
+            # the battery may actually be low.
+            if raw_battery == 0xFF:
+                log.warning("Battery read returned 0xFF (sentinel/unknown), retrying... (attempt %d)" % (attempt + 1))
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                log.error("Battery consistently returning 0xFF - mouse firmware may need a power cycle")
+                return -1, False
 
             # Only treat raw=0 or raw=1 as corrupted reads (USB conflict)
             # Real low battery values (raw >= 2) should NOT be ignored,
@@ -626,6 +808,9 @@ def read_battery_raw():
                     time.sleep(1)
                     continue
                 return -1, False
+
+            battery_pct = int(raw_battery / 255 * 100)
+            is_charging = (charging == 1)
 
             return battery_pct, is_charging
         except Exception as e:
@@ -644,9 +829,9 @@ def read_battery_raw():
 # Lighting Logic
 # ══════════════════════════════════════════════════════
 
-from openrgb.utils import RGBColor
-
 lighting_state = "on"
+last_battery_pct = -1
+last_charging_state = 0  # last known charging state for heartbeat fallback
 
 def find_razer_index(devs):
     for i, dev in enumerate(devs):
@@ -655,50 +840,108 @@ def find_razer_index(devs):
     return -1
 
 def set_mouse_light_off(devs, razer_idx):
-    """Turn off mouse lighting by sending black colors."""
     try:
         dev = devs[razer_idx]
-        dev.set_mode(0)
+        dev.set_mode(0)  # Direct mode
         dev.set_colors([RGBColor(0, 0, 0)] * len(dev.colors))
-        log.info("  Mouse lighting: OFF (black frame)")
+        log.info("  Mouse lighting: OFF")
     except Exception as e:
         log.error("  Failed to turn off mouse lighting: %s" % e)
 
-def set_mouse_light_on(devs, states, razer_idx):
-    """Turn on mouse lighting by loading the OpenRGB profile.
-    This restores all device colors/modes from the saved profile file,
-    which is more reliable than manually restoring saved colors.
-    """
+def _profile_mouse_state(dev_name):
+    """Read the mouse state (mode + colors) from the saved profile file."""
+    profile_path = os.path.join(os.environ.get("APPDATA", ""), "OpenRGB", "123.orp")
     try:
-        client = OpenRGBClient(address="localhost", port=6742)
+        devices = parse_orp_profile(profile_path)
+        for name, mode_idx, colors_u32 in devices:
+            if name == dev_name or "Razer" in name:
+                colors = []
+                for c in colors_u32:
+                    r = (c >> 16) & 0xFF
+                    g = (c >> 8) & 0xFF
+                    b = c & 0xFF
+                    colors.append(RGBColor(r, g, b))
+                return {"mode": mode_idx, "colors": colors}
+    except Exception as e:
+        log.warning("Failed to parse profile for mouse state: %s" % e)
+    return None
+
+def set_mouse_light_on(devs, states, razer_idx):
+    """Turn on mouse lighting by loading the OpenRGB profile."""
+    try:
+        client = OpenRGBClient(address=OPENRGB_HOST, port=OPENRGB_PORT)
         client.update_profiles()
-        if client.profiles:
-            profile_name = client.profiles[0].name
-            client.load_profile(profile_name)
-            log.info("  Mouse lighting: ON (loaded profile '%s')" % profile_name)
-        else:
-            log.warning("  No profiles found, falling back to saved colors")
-            dev = devs[razer_idx]
-            state = states[razer_idx]
-            if state is not None:
-                dev.set_mode(0)
-                dev.set_colors(state["colors"])
-                log.info("  Mouse lighting: ON (fallback: Direct + saved colors)")
+        profile = None
+        for p in client.profiles:
+            if p.name == "123":
+                profile = p
+                break
+        if profile is None and client.profiles:
+            profile = client.profiles[0]
+        if profile is not None:
+            client.load_profile(profile.name)
+            log.info("  Mouse lighting: ON (loaded profile '%s')" % profile.name)
+            mouse_state = _profile_mouse_state(devs[razer_idx].name)
+            if mouse_state is not None:
+                states[razer_idx] = mouse_state
+            return
+        log.warning("  No profiles found, falling back to saved colors")
     except Exception as e:
         log.error("  Failed to load profile: %s" % e)
-        # Fallback: restore saved colors
-        try:
-            dev = devs[razer_idx]
-            state = states[razer_idx]
-            if state is not None:
-                dev.set_mode(0)
-                dev.set_colors(state["colors"])
-                log.info("  Mouse lighting: ON (fallback after error: Direct + saved colors)")
-        except Exception as e2:
-            log.error("  Fallback also failed: %s" % e2)
+    # Fallback: restore the saved state
+    try:
+        dev = devs[razer_idx]
+        state = states[razer_idx]
+        if state is not None:
+            dev.set_mode(state["mode"])
+            dev.set_colors(state["colors"])
+            log.info("  Mouse lighting: ON (restored saved state)")
+    except Exception as e:
+        log.error("  Failed to restore mouse lighting: %s" % e)
+
+def read_charging_only():
+    """Lightweight: read only charging state (0x07/0x84) for tray red dot.
+    Returns 0/1, or None on failure. Does NOT read battery level."""
+    with _usb_lock:
+        return _read_charging_only_locked()
+
+def _read_charging_only_locked():
+    dev = None
+    try:
+        dev = usb.core.find(idVendor=RAZER_VID, custom_match=lambda d: d.idProduct in RAZER_PIDS, backend=_USB_BACKEND)
+        if dev is None:
+            devs = list(usb.core.find(find_all=True, idVendor=RAZER_VID, custom_match=lambda d: d.idProduct in RAZER_PIDS, backend=_USB_BACKEND))
+            if not devs:
+                return None
+            dev = devs[0]
+        usb.util.claim_interface(dev, 0)
+        dev.set_configuration()
+        charge_msg = generate_msg(0x07, 0x84, 0x02)
+        dev.ctrl_transfer(bmRequestType=0x21, bRequest=0x09, wValue=0x0300, data_or_wLength=charge_msg)
+        time.sleep(0.05)
+        result2 = dev.ctrl_transfer(bmRequestType=0xa1, bRequest=0x01, wValue=0x0300, data_or_wLength=90)
+        ch_raw = result2[9]
+        if ch_raw == 0xFF:
+            log.warning("Charging read returned 0xFF (unknown), keeping previous state")
+            return None
+        return 1 if ch_raw == 1 else 0
+    except Exception as e:
+        log.warning("Charging read failed: %s" % e)
+        return None
+    finally:
+        if dev is not None:
+            try:
+                usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+            try:
+                usb.util.dispose_resources(dev)
+            except Exception:
+                pass
+
 
 def check_battery_and_manage_lighting(devs, states):
-    global lighting_state
+    global lighting_state, last_battery_pct, last_charging_state
     razer_idx = find_razer_index(devs)
     if razer_idx < 0:
         log.warning("Razer mouse not found in device list")
@@ -708,13 +951,15 @@ def check_battery_and_manage_lighting(devs, states):
 
     if battery_pct < 0:
         log.warning("Battery read failed, keeping current lighting state: %s" % lighting_state)
+        write_battery_file(-1, False)
         return
 
     log.info("Battery: %d%%, charging: %s, lighting: %s" %
              (battery_pct, "yes" if is_charging else "no", lighting_state))
-
     # Write battery info to file for OpenRGB tray icon
     write_battery_file(battery_pct, is_charging)
+    last_battery_pct = battery_pct
+    last_charging_state = 1 if is_charging else 0
 
     if lighting_state == "on" and battery_pct < BATTERY_LOW_THRESHOLD:
         lighting_state = "off"
@@ -731,9 +976,9 @@ def check_battery_and_manage_lighting(devs, states):
 # ══════════════════════════════════════════════════════
 
 def main():
-    global need_openrgb_restart, saw_device_removal
+    global need_openrgb_restart, saw_device_removal, last_charging_state
     log.info("=" * 60)
-    log.info("OpenRGB Keeper started (simple poll mode)")
+    log.info("OpenRGB Keeper started (WMI event mode)")
     log.info("Push interval: %ds, Battery check: %ds" %
              (HIGH_FREQ_INTERVAL, BATTERY_CHECK_INTERVAL))
     log.info("=" * 60)
@@ -777,10 +1022,11 @@ def main():
 
     # ── Simple main loop ──────────────────────────────
     # Single loop, no nested high-freq/event-driven modes.
-    # The poller thread sets need_openrgb_restart on device removal,
-    # and device_wake_event on any device change.
+    # The poller thread sets need_openrgb_restart on monitored-device removal,
+    # and device_wake_event on any monitored-device change (Candy only).
     last_push = time.time()
     last_battery_check = time.time()
+    last_charge_check = time.time()
     push_count = 0
 
     while True:
@@ -812,23 +1058,26 @@ def main():
                     log.info("State re-applied after restart")
                 else:
                     log.error("Fast restart failed, trying normal connect...")
-                    client, devs = connect()
-                    if client is not None:
+                    new_client, new_devs = connect()
+                    if new_client is not None:
+                        client, devs = new_client, new_devs
                         states = capture_state(devs)
                         razer_idx = find_razer_index(devs)
                         skip = razer_idx if lighting_state == "off" else -1
                         apply_state(devs, states, skip_index=skip)
+                    else:
+                        log.error("Reconnect failed, will retry on next push")
 
                 last_push = time.time()
                 last_battery_check = time.time()
                 push_count = 0
                 continue
 
-            # 2) Check for non-physical device event (mouse wake/sleep)
+            # 2) Check for monitored-device event (Candy change; not mouse wake/sleep)
             if device_wake_event.is_set():
                 device_wake_event.clear()
                 if not need_openrgb_restart:
-                    log.info("Device event (non-physical), fast recovery...")
+                    log.info("Device event (monitored device), fast recovery...")
                     time.sleep(3)
                     try:
                         devs = client.ee_devices
@@ -886,8 +1135,6 @@ def main():
                         continue
 
                 log.info("Periodic push #%d (%d devices)" % (push_count, len(devs)))
-                # Skip mouse push only when lighting is off
-                # When lighting is on, push to keep lights alive
                 skip = razer_idx if lighting_state == "off" else -1
                 try:
                     success, fail = apply_state(devs, states, skip_index=skip)
@@ -895,6 +1142,18 @@ def main():
                     # to detect dead SDK connection and trigger reconnect
                     if fail > 0 and success == 0:
                         raise ConnectionError("All %d device(s) failed to apply state" % fail)
+                    if fail > 0:
+                        # Partial failure: refresh state once (e.g. LED count changed)
+                        log.warning("Partial push failure (%d/%d failed), re-capturing state..." %
+                                    (fail, len(devs)))
+                        current_devs = client.ee_devices
+                        if len(current_devs) == len(devs):
+                            states = capture_state(devs)
+                            apply_state(devs, states, skip_index=skip)
+                        else:
+                            devs = current_devs
+                            states = capture_state(devs)
+                            apply_state(devs, states, skip_index=skip)
                 except (ConnectionError, OSError, BrokenPipeError) as e:
                     log.error("Push failed (connection): %s, reconnecting..." % e)
                     if not is_openrgb_running():
@@ -904,29 +1163,36 @@ def main():
                         kill_openrgb()
                         start_openrgb()
                         time.sleep(OPENRGB_START_DELAY)
-                    client, devs = connect()
-                    if client is not None:
+                    new_client, new_devs = connect()
+                    if new_client is not None:
+                        client, devs = new_client, new_devs
                         states = capture_state(devs)
                         razer_idx = find_razer_index(devs)
                         skip = razer_idx if lighting_state == "off" else -1
                         apply_state(devs, states, skip_index=skip)
+                    else:
+                        log.error("Reconnect failed, will retry on next push")
                 except Exception as e:
                     log.warning("Push failed: %s" % e)
-
-                # Also read battery and update tray icon file (every push)
-                try:
-                    bp, ch = read_battery_raw()
-                    if bp >= 0:
-                        write_battery_file(bp, ch)
-                except Exception:
-                    pass
-
                 last_push = now
 
             # 4) Battery check
             if now - last_battery_check >= BATTERY_CHECK_INTERVAL:
                 check_battery_and_manage_lighting(devs, states)
                 last_battery_check = now
+
+            # 4b) Charging status fast refresh (tray red dot every 5s)
+            # Heartbeat: always write battery.txt (even on failure) so the
+            # OpenRGB status bar / tray tooltip can tell keeper is alive.
+            # On failure, fall back to the last known charging state.
+            if now - last_charge_check >= CHARGE_CHECK_INTERVAL:
+                ch = read_charging_only()
+                if ch is not None:
+                    write_battery_file(last_battery_pct, ch)
+                    last_charging_state = ch
+                else:
+                    write_battery_file(last_battery_pct, last_charging_state)
+                last_charge_check = now
 
             # 5) SDK heartbeat (only if no push for a while)
             if now - last_push >= LOW_FREQ_INTERVAL:
@@ -944,8 +1210,8 @@ def main():
                     last_push = time.time()
                     last_battery_check = time.time()
 
-            # 6) Sleep
-            time.sleep(5)
+            # 6) Sleep until next charge-check boundary (keeps 5s timing precise)
+            time.sleep(max(0.5, min(5.0, CHARGE_CHECK_INTERVAL - (time.time() - last_charge_check))))
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
@@ -956,4 +1222,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Single-instance guard: refuse to run if another keeper is alive
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "OpenRGBKeeperMutex")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("Another OpenRGB Keeper instance is already running, exiting.")
+        sys.exit(0)
+    try:
+        main()
+    finally:
+        ctypes.windll.kernel32.ReleaseMutex(_mutex)
+        ctypes.windll.kernel32.CloseHandle(_mutex)
