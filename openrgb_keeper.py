@@ -29,7 +29,7 @@ import configparser
 from pathlib import Path
 
 from openrgb import OpenRGBClient
-from openrgb.utils import RGBColor
+from openrgb.utils import RGBColor, LocalProfile
 
 import libusb_package
 import usb.core
@@ -554,82 +554,11 @@ def restart_openrgb_fast(states_backup=None):
 
 
 def parse_orp_profile(profile_path):
-    """Parse an OpenRGB v4 profile (.orp) file.
-    Returns list of (name, active_mode, colors_uint32) in file order."""
-    import struct as _struct
-
-    def _u16(b, p): return _struct.unpack_from("<H", b, p)[0], p + 2
-    def _u32(b, p): return _struct.unpack_from("<I", b, p)[0], p + 4
-    def _i32(b, p): return _struct.unpack_from("<i", b, p)[0], p + 4
-    def _s(b, p):
-        n, p = _u16(b, p)
-        return b[p:p + n].rstrip(b"\0").decode("utf-8", "replace"), p + n
-
+    """Parse an OpenRGB profile (.orp) file using the SDK's built-in parser.
+    Returns list of (name, active_mode, [RGBColor]) in file order."""
     with open(profile_path, "rb") as f:
-        data = f.read()
-
-    if not data.startswith(b"OPENRGB_PROFILE"):
-        raise ValueError("Not an OpenRGB profile")
-
-    # Validate version (4 bytes after the 16-byte header)
-    if len(data) < 20:
-        raise ValueError("Profile too short")
-    version = _struct.unpack_from("<I", data, 16)[0]
-    if version != 4:
-        log.warning("Unexpected profile version %d (expected 4)" % version)
-
-    p = 16 + 4  # header + version
-    devices = []
-    while p < len(data):
-        if p + 4 > len(data):
-            log.warning("Truncated profile: no size field at %d" % p)
-            break
-        size, p = _u32(data, p)
-        if size < 4 or p + (size - 4) > len(data):
-            log.warning("Truncated profile: device block size %d invalid at %d" % (size, p))
-            break
-        end = p + size - 4
-        _dtype, p = _u32(data, p)
-        name, p = _s(data, p)
-        _vendor, p = _s(data, p)
-        _desc, p = _s(data, p)
-        _ver, p = _s(data, p)
-        _serial, p = _s(data, p)
-        _loc, p = _s(data, p)
-        _num_modes, p = _u16(data, p)
-        active_mode, p = _i32(data, p)
-        for _ in range(_num_modes):
-            _mname, p = _s(data, p)
-            for _ in range(12):
-                p += 4
-            _mc, p = _u16(data, p)
-            p += 4 * _mc
-        _num_zones, p = _u16(data, p)
-        for _ in range(_num_zones):
-            _zname, p = _s(data, p)
-            for _ in range(4):
-                p += 4
-            _mlen, p = _u16(data, p)
-            if _mlen > 0:
-                _h, p = _u32(data, p)
-                _w, p = _u32(data, p)
-                p += 4 * _h * _w
-            _nseg, p = _u16(data, p)
-            for _ in range(_nseg):
-                _segname, p = _s(data, p)
-                p += 12
-        _num_leds, p = _u16(data, p)
-        for _ in range(_num_leds):
-            _lname, p = _s(data, p)
-            p += 4
-        _num_colors, p = _u16(data, p)
-        colors = []
-        for _ in range(_num_colors):
-            c, p = _u32(data, p)
-            colors.append(c)
-        devices.append((name, active_mode, colors))
-        p = end
-    return devices
+        profile = LocalProfile.unpack(f)
+    return [(c.name, c.active_mode, list(c.colors)) for c in profile.controllers]
 
 
 def load_expected_dram_states():
@@ -639,15 +568,9 @@ def load_expected_dram_states():
     try:
         devices = parse_orp_profile(profile_path)
         drams = []
-        for name, mode_idx, colors_u32 in devices:
+        for name, mode_idx, colors in devices:
             if "ENE DRAM" in name:
-                colors = []
-                for c in colors_u32:
-                    r = (c >> 16) & 0xFF
-                    g = (c >> 8) & 0xFF
-                    b = c & 0xFF
-                    colors.append(RGBColor(r, g, b))
-                drams.append((mode_idx, colors))
+                drams.append((mode_idx, list(colors)))
         if drams:
             log.info("Profile expected states loaded: %d ENE DRAM device(s) from %s" % (len(drams), os.path.basename(profile_path)))
         return drams
@@ -853,15 +776,9 @@ def _profile_mouse_state(dev_name):
     profile_path = os.path.join(os.environ.get("APPDATA", ""), "OpenRGB", "123.orp")
     try:
         devices = parse_orp_profile(profile_path)
-        for name, mode_idx, colors_u32 in devices:
+        for name, mode_idx, colors in devices:
             if name == dev_name or "Razer" in name:
-                colors = []
-                for c in colors_u32:
-                    r = (c >> 16) & 0xFF
-                    g = (c >> 8) & 0xFF
-                    b = c & 0xFF
-                    colors.append(RGBColor(r, g, b))
-                return {"mode": mode_idx, "colors": colors}
+                return {"mode": mode_idx, "colors": list(colors)}
     except Exception as e:
         log.warning("Failed to parse profile for mouse state: %s" % e)
     return None
