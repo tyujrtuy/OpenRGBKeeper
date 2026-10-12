@@ -635,13 +635,15 @@ def get_transaction_id():
             try:
                 config = configparser.ConfigParser()
                 config.read(path)
-                for section in config.sections():
-                    if "tranid" in config[section]:
+                sections = ["DEFAULT"] + config.sections()
+                for section in sections:
+                    if section in config and "tranid" in config[section]:
                         val = config[section]["tranid"]
                         tran_id = int(val, 16) if val.startswith("0x") else int(val)
                         if not (0 <= tran_id <= 0xFF):
                             tran_id = 0x3F
-                        log.info("Transaction ID from rebt.ini: 0x%02X" % tran_id)
+                        log.info("Transaction ID from %s [%s]: 0x%02X" % (os.path.basename(path), section, tran_id))
+                        break
             except (ValueError, configparser.Error) as e:
                 log.warning("Failed to parse rebt.ini (%s), using default tranid" % e)
                 tran_id = 0x3F
@@ -709,22 +711,9 @@ def _read_battery_raw_locked():
                 log.error("Charging status consistently 0xFF - mouse firmware may need a power cycle")
                 return -1, False
 
-            # 0xFF (255) is a sentinel value meaning the mouse firmware
-            # failed to return a valid battery reading. This is a known
-            # issue with Razer wireless mice (OpenRazer issue #2109, #2122).
-            # Treating it as 100% would incorrectly keep lighting on when
-            # the battery may actually be low.
-            if raw_battery == 0xFF:
-                log.warning("Battery read returned 0xFF (sentinel/unknown), retrying... (attempt %d)" % (attempt + 1))
-                if attempt < 2:
-                    time.sleep(1)
-                    continue
-                log.error("Battery consistently returning 0xFF - mouse firmware may need a power cycle")
-                return -1, False
-
-            # Only treat raw=0 or raw=1 as corrupted reads (USB conflict)
-            # Real low battery values (raw >= 2) should NOT be ignored,
-            # even if charging — the battery may genuinely be very low.
+            # When RF link is active (charging is 0 or 1), raw_battery == 255 (0xFF)
+            # corresponds to 100% full charge (255/255 = 100%).
+            # Only treat raw=0 or raw=1 as corrupted reads (USB conflict).
             if raw_battery <= 1:
                 log.warning("Corrupted battery read (raw=%d), retrying..." % raw_battery)
                 if attempt < 2:
@@ -732,7 +721,7 @@ def _read_battery_raw_locked():
                     continue
                 return -1, False
 
-            battery_pct = int(raw_battery / 255 * 100)
+            battery_pct = min(100, int(raw_battery / 255 * 100))
             is_charging = (charging == 1)
 
             return battery_pct, is_charging
